@@ -15,8 +15,12 @@ import {
   type ReactNode,
 } from "react";
 
+// REST is same-origin, proxied to the mini-app backend by Next (next.config.ts),
+// so the browser only talks to the web port — enough when a firewall/Tailscale
+// ACL forwards the web port but not the API port. The exchange WS is a
+// low-latency enhancement; when blocked, REST polling carries the UI.
 const host = typeof window !== "undefined" ? window.location.hostname : "localhost";
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? `http://${host}:8170`;
+export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
 const EXCHANGE_WS =
   process.env.NEXT_PUBLIC_EXCHANGE_WS ?? `ws://${host}:8140/ws`;
 
@@ -138,15 +142,36 @@ export function AppProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 2. market data straight from the exchange WS (public feed)
+  // 2. market data. Poll the proxied REST endpoints (same-origin → :8170 →
+  // exchange) as the reliable path, since the exchange WS can be blocked by a
+  // proxy/firewall; the WS below is a low-latency enhancement.
   useEffect(() => {
     if (!token) return;
     refresh();
+    let wsLive = false;
+    const poll = () => {
+      if (wsLive) return;
+      api("/api/orderbook")
+        .then((r) => r.json())
+        .then((ob: { depth?: { bids?: PriceLevel[]; asks?: PriceLevel[] }; last?: number }) => {
+          setBids(ob.depth?.bids ?? []);
+          setAsks(ob.depth?.asks ?? []);
+          if (ob.last) setLast(ob.last);
+        })
+        .catch(() => {});
+      refresh();
+    };
+    poll();
+    const pollTimer = setInterval(poll, 1500);
+
     let ws: WebSocket | null = null;
     let closed = false;
     let timer: ReturnType<typeof setTimeout>;
     const connect = () => {
       ws = new WebSocket(EXCHANGE_WS);
+      ws.onopen = () => {
+        wsLive = true;
+      };
       ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data) as { type: string; data: any };
         if (msg.type === "depth") {
@@ -170,13 +195,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
       };
       ws.onclose = () => {
-        if (!closed) timer = setTimeout(connect, 1500);
+        wsLive = false;
+        if (!closed) timer = setTimeout(connect, 3000);
       };
     };
     connect();
     return () => {
       closed = true;
       clearTimeout(timer);
+      clearInterval(pollTimer);
       ws?.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
